@@ -1,0 +1,40 @@
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    # Disable all default plugins first
+    preFilter:
+      disabled:
+      - name: "*"
+    filter:
+      disabled:
+      - name: "*"
+      enabled:
+      - name: EnergyAware  # Only our filter runs
+    postFilter:
+      disabled:
+      - name: "*"
+    preScore:
+      disabled:
+      - name: "*"
+    score:
+      disabled:
+      - name: "*"
+      enabled:
+      - name: EnergyAware  # Only our score runs
+    reserve:
+      disabled:
+      - name: "*"
+    preBind:
+      disabled:
+      - name: "*"
+    bind:
+      disabled:
+      - name: "*"
+      enabled:
+      - name: DefaultBinder  # We still need this to bind pods
+    permit:
+      disabled:
+      - name: "*"
+  pluginConfig: []
