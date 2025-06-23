@@ -121,16 +121,34 @@ func computeRates(nodeName string) (lambda, mu, varS float64) {
 }
 
 // mockNodeWatts produces a deterministic pseudo-random power draw for a node.
+// It guarantees a realistic range (20–100 W) so that downstream integer
+// conversions never drop to 0.
 func mockNodeWatts(nodeName string) float64 {
-	hash := fnv.New32a()
-	timestamp := time.Now().Unix() / 10 // refresh every 10s
-	hash.Write([]byte(fmt.Sprintf("%s-%d", nodeName, timestamp)))
-	nodeHash := hash.Sum32()
+    // Hash of node name (stable per node) combined with coarse time slice so
+    // the number changes slowly but predictably.
+    hash := fnv.New32a()
+    // Change every 30 s to avoid jittering every second but still show dynamics.
+    slice := time.Now().Unix() / 30
+    hash.Write([]byte(fmt.Sprintf("%s-%d", nodeName, slice)))
+    nodeHash := hash.Sum32()
 
-	jitter := float64(nodeHash%2000-1000) / 10000.0
-	variance := 1 - nodeVariance + float64(nodeHash%uint32(2*nodeVariance*100))/100.0 + jitter
-	watts := baseWatts * variance
-	return math.Max(10, math.Min(100, watts))
+    // Base variance derived from hash – spread ±nodeVariance (e.g. ±50%).
+    frac := float64(nodeHash%100) / 100.0 // 0.00-0.99
+    variance := 1 - nodeVariance + frac*2*nodeVariance // 1±nodeVariance
+
+    // Additional tiny jitter so multiple nodes with same frac differ a little.
+    jitter := (float64(int(nodeHash%1000)-500) / 10000.0) // ±0.05
+    variance += jitter
+
+    // Apply and clamp to safe range.
+    watts := baseWatts * variance
+    if watts < 20 {
+        watts = 20 // floor to 20 W so integer rounding never shows 0
+    }
+    if watts > 100 {
+        watts = 100
+    }
+    return watts
 }
 
 // initLogging sets up file-based logging
@@ -246,11 +264,12 @@ func (e *EnergyAware) Score(ctx context.Context, _ *framework.CycleState, pod *c
 	lambda, mu, varS := computeRates(nodeName)
 
 	// ---------- Queueing delay ----------
+	jobDur := time.Duration(serviceTime * float64(time.Second))
 	var wq float64
 	if jobType == "long" {
-		wq = kronos.CalculateWqMG1(lambda, mu, varS)
+		wq = kronos.CalculateWqMG1(lambda, mu, varS, jobDur)
 	} else {
-		wq = kronos.CalculateWqMM1(lambda, mu)
+		wq = kronos.CalculateWqMM1(lambda, mu, jobDur)
 	}
 	if math.IsInf(wq, 1) || math.IsNaN(wq) {
 		wq = 1e6 // huge penalty for unstable nodes
@@ -363,25 +382,67 @@ func (e *EnergyAware) NormalizeScore(_ context.Context, _ *framework.CycleState,
 }
 func (e *EnergyAware) ScoreExtensions() framework.ScoreExtensions { return e }
 
-// ------------------------ helpers ------------------------------
+const (
+    // podDecayHalfLife is the time after which a pod's impact is halved
+    podDecayHalfLife = 30 * time.Minute
+    
+    // jobTypeWeights define how much influence each job type has on scoring
+    shortJobWeight = 0.8  // Short jobs have less impact
+    longJobWeight  = 1.2  // Long jobs have more impact initially
+)
 
-// calculateQueueScore returns a score (0-100) based on node queue length and job type.
-// For short jobs (default): light penalty per queued pod.
-// For long jobs: heavier penalty.
+// calculateQueueScore returns a score (0-100) based on node queue state with time decay.
+// It considers:
+// - How long pods have been running (older pods have less impact)
+// - Job type (long/short)
+// - Current queue length
 func calculateQueueScore(nodeInfo *framework.NodeInfo, jobType string) int64 {
-	// Use the correct method to get pods on the node
-	podsOnNode := nodeInfo.Pods
-	queueLen := len(podsOnNode)
-
-	// Parameters: how much each queued pod reduces score
-	var penaltyPerPod int64 = 5 // short jobs
-	if jobType == "long" {
-		penaltyPerPod = 10 // long jobs are more sensitive
-	}
-
-	score := maxScore - int64(queueLen)*penaltyPerPod
-	if score < 0 {
-		score = 0
-	}
-	return score
+    now := time.Now()
+    totalImpact := 0.0
+    
+    // Calculate impact of each pod on the node
+    for _, podInfo := range nodeInfo.Pods {
+        if podInfo.Pod.Status.StartTime == nil {
+            continue
+        }
+        
+        // Get job type from pod labels (default to short)
+        podJobType := podInfo.Pod.Labels["jobType"]
+        if podJobType == "" {
+            podJobType = "short"
+        }
+        
+        // Calculate time-based decay
+        runningTime := now.Sub(podInfo.Pod.Status.StartTime.Time)
+        decay := math.Exp(-math.Ln2 * runningTime.Seconds() / podDecayHalfLife.Seconds())
+        
+        // Apply job type weight
+        weight := shortJobWeight
+        if podJobType == "long" {
+            weight = longJobWeight
+        }
+        
+        // Add to total impact with decay and weight
+        totalImpact += decay * weight
+    }
+    
+    // Convert impact to score (0-100)
+    // More impact = lower score
+    score := maxScore - int64(totalImpact*5) // Adjust multiplier as needed
+    
+    // Ensure score is within bounds
+    if score < 0 {
+        return 0
+    }
+    if score > maxScore {
+        return maxScore
+    }
+    
+    klog.V(4).InfoS("Queue score calculation",
+        "node", nodeInfo.Node().Name,
+        "totalImpact", totalImpact,
+        "finalScore", score,
+        "jobType", jobType)
+        
+    return score
 }

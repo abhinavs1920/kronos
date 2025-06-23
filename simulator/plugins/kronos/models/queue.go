@@ -1,6 +1,9 @@
 package models
 
-import "math"
+import (
+    "math"
+    "time"
+)
 
 // Delay model constants to avoid magic numbers
 const (
@@ -8,24 +11,24 @@ const (
     epsilon = 1e-9
 )
 
-// calculateUtilization returns the traffic intensity (ρ) of the queue.
+// calculateUtilization returns the traffic intensity (ρ) of the queue with
+// time-based decay that reduces the impact of long-running jobs.
 //
-//  ρ = λ / μ
+//  ρ(t) = (λ / μ) * decay(t)
 //
-// Where:
-//  λ (lambda) is the arrival rate – average number of jobs arriving per unit time.
-//  μ (mu)     is the service rate  – average number of jobs the server can complete per unit time.
-//
-// The utilisation must satisfy 0 ≤ ρ < 1 for the steady-state formulas that follow to be valid. In
-// practice we cap the result to the open interval (0,1) to avoid division-by-zero behaviour when the
-// caller accidentally passes λ ≥ μ.
-func calculateUtilization(lambda, mu float64) float64 {
+// decay(t) halves the contribution every 30 minutes.
+func calculateUtilization(lambda, mu float64, jobDuration time.Duration) float64 {
     if mu <= 0 {
-        return 1 // Server with zero capacity – system is saturated
+        return 1 // saturated – no service capacity
     }
-    rho := lambda / mu
+
+    // Time-based exponential decay to gradually "forget" old work.
+    const halfLife = 30 * time.Minute
+    decay := math.Exp(-math.Ln2 * jobDuration.Seconds() / halfLife.Seconds())
+
+    rho := (lambda / mu) * decay
     if rho >= 1-epsilon {
-        return 1 - epsilon // cap just below 1 to keep subsequent formulas finite
+        return 1 - epsilon
     }
     if rho < 0 {
         return 0
@@ -41,12 +44,21 @@ func calculateUtilization(lambda, mu float64) float64 {
 //       = λ / (μ * (μ - λ))
 //
 // As ρ → 1 the waiting time grows unbounded, capturing the steep latency increase at high load.
-func calculateWqMM1(lambda, mu float64) float64 {
-    rho := calculateUtilization(lambda, mu)
-    denom := mu - lambda
+// calculateWqMM1 returns the expected waiting time in an M/M/1 queue with
+// time-decay adjustment.
+func calculateWqMM1(lambda, mu float64, jobDuration time.Duration) float64 {
+    rho := calculateUtilization(lambda, mu, jobDuration)
+
+    // Effective arrival rate after decay for stability.
+    const halfLife = 30 * time.Minute
+    decay := math.Exp(-math.Ln2 * jobDuration.Seconds() / halfLife.Seconds())
+    effectiveLambda := lambda * decay
+
+    denom := mu - effectiveLambda
     if denom <= 0 {
-        return math.Inf(1) // Unstable queue – infinite expected waiting time
+        return math.Inf(1)
     }
+
     return rho / denom
 }
 
@@ -63,18 +75,20 @@ func calculateWqMM1(lambda, mu float64) float64 {
 // The caller is responsible for supplying an estimated variance of the service time distribution.
 // For an exponential service time Var(S) = 1/μ², which makes this formula fall back to the M/M/1
 // result.
-func calculateWqMG1(lambda, mu, varianceS float64) float64 {
-    rho := calculateUtilization(lambda, mu)
+// calculateWqMG1 returns the expected waiting time for an M/G/1 queue with
+// time-decay adjustment (Pollaczek-Khinchine formula).
+func calculateWqMG1(lambda, mu, varianceS float64, jobDuration time.Duration) float64 {
+    rho := calculateUtilization(lambda, mu, jobDuration)
     if rho >= 1-epsilon {
-        return math.Inf(1) // Unstable system
-    }
-
-    if mu <= 0 {
         return math.Inf(1)
     }
 
-    meanS := 1 / mu
-    es2 := varianceS + meanS*meanS
+    // Apply decay to arrival rate.
+    const halfLife = 30 * time.Minute
+    decay := math.Exp(-math.Ln2 * jobDuration.Seconds() / halfLife.Seconds())
 
-    return (lambda * es2) / (2 * (1 - rho))
+    meanService := 1.0 / mu
+    secondMoment := varianceS + meanService*meanService
+
+    return (lambda * decay * secondMoment) / (2 * (1 - rho))
 }
